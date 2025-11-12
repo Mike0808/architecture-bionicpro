@@ -1,0 +1,260 @@
+x-airflow-common: &airflow-common
+  build:
+    context: .
+    dockerfile: Dockerfile
+  environment: &airflow-common-env
+    AIRFLOW__CORE__EXECUTOR: LocalExecutor
+    AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@postgres/airflow
+    AIRFLOW__CORE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@postgres/airflow
+    AIRFLOW__CORE__FERNET_KEY: ""
+    AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: "true"
+    AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+    AIRFLOW__API__AUTH_BACKENDS: "airflow.api.auth.backend.basic_auth,airflow.api.auth.backend.session"
+    AIRFLOW__SCHEDULER__ENABLE_HEALTH_CHECK: "true"
+    AIRFLOW__WEBSERVER__SECRET_KEY: "your_airflow_webserver_sec_key"
+    _PIP_ADDITIONAL_REQUIREMENTS: "psycopg2-binary clickhouse-driver"
+    AIRFLOW_INPUT_DIR: "/opt/airflow/dag-inputs"
+  volumes:
+    - ./dags:/opt/airflow/dags
+    - ./dags/sql:/opt/airflow/dags/sql
+    - ./requirements.txt:/opt/airflow/requirements.txt
+    - ./data:/opt/airflow/sample_files
+  user: "${AIRFLOW_UID:-50000}:0"
+  depends_on: &airflow-common-depends-on
+    postgres:
+      condition: service_healthy
+    clickhouse:
+      condition: service_healthy
+  networks:
+    - dag_sample
+
+services:
+  # === PostgreSQL: 3 БД (airflow, crm, telemetry) ===
+  postgres:
+    image: postgres:16
+    volumes:
+      # Инициализация всех БД при первом запуске
+      - ./db/init-all.sh:/docker-entrypoint-initdb.d/init-all.sh
+      - ./db/init-crm.sql:/docker-entrypoint-initdb.d/init-crm.sql
+      - ./db/init-db.sql:/docker-entrypoint-initdb.d/init-db.sql
+    environment:
+      POSTGRES_USER: airflow
+      POSTGRES_PASSWORD: airflow
+      POSTGRES_DB: airflow # БД по умолчанию
+    ports:
+      - "5432:5432"
+    logging:
+      options:
+        max-size: 10m
+        max-file: "3"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U airflow -d airflow"]
+      interval: 10s
+      retries: 5
+      start_period: 5s
+    restart: always
+    networks:
+      - dag_sample
+
+  # === ClickHouse ===
+  clickhouse:
+    image: clickhouse/clickhouse-server:24.3
+    ports:
+      - "8123:8123" # HTTP
+      - "9000:9000" # Native
+    volumes:
+      - ./db/init-dm.sql:/docker-entrypoint-initdb.d/init-dm.sql
+      - ./ch-config/clickhouse-users.xml:/etc/clickhouse-server/users.d/airflow-user.xml
+    environment:
+      CLICKHOUSE_USER: default
+      CLICKHOUSE_PASSWORD: ""
+    logging:
+      options:
+        max-size: 10m
+        max-file: "3"
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "wget --quiet --tries=1 --spider http://localhost:8123/ping || exit 1",
+        ]
+      interval: 10s
+      retries: 5
+      start_period: 5s
+    restart: always
+    networks:
+      - dag_sample
+
+  # === Airflow сервисы (без изменений, кроме depends_on) ===
+  airflow-webserver:
+    <<: *airflow-common
+    ports:
+      - "8082:8080"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      clickhouse:
+        condition: service_healthy
+      airflow-init:
+        condition: service_completed_successfully
+    command: webserver
+    networks:
+      - dag_sample
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://airflow-webserver:8080/health || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  airflow-scheduler:
+    <<: *airflow-common
+    command: scheduler
+    depends_on:
+      postgres:
+        condition: service_healthy
+      clickhouse:
+        condition: service_healthy
+      airflow-webserver:
+        condition: service_healthy
+      airflow-init:
+        condition: service_completed_successfully
+    networks:
+      - dag_sample
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://airflow-webserver:8080/health || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  airflow-triggerer:
+    <<: *airflow-common
+    command: bash -c "airflow triggerer"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      clickhouse:
+        condition: service_healthy
+      airflow-init:
+        condition: service_completed_successfully
+    networks:
+      - dag_sample
+    healthcheck:
+      test: ["CMD-SHELL", "ps aux | grep '[a]irflow triggerer'"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+    restart: always
+
+  airflow-cli:
+    <<: *airflow-common
+    profiles:
+      - debug
+    command: bash
+
+  airflow-init:
+    <<: *airflow-common
+    command: |
+      bash -c "
+        airflow db init &&
+        airflow users create \
+          --username admin \
+          --firstname admin \
+          --lastname admin \
+          --role Admin \
+          --email admin@sample.ru \
+          --password admin
+      "
+    networks:
+      - dag_sample
+  keycloak_db:
+    image: postgres:14
+    environment:
+      POSTGRES_DB: keycloak_db
+      POSTGRES_USER: keycloak_user
+      POSTGRES_PASSWORD: keycloak_password
+    volumes:
+      - postgres-keycloak-data:/var/lib/postgresql/data
+    ports:
+      - "5433:5432"
+    networks:
+      - dag_sample     
+
+  keycloak:
+    image: quay.io/keycloak/keycloak:21.1
+    environment:
+      KEYCLOAK_ADMIN: admin
+      KEYCLOAK_ADMIN_PASSWORD: admin
+      KC_DB: postgres
+      KC_DB_URL: jdbc:postgresql://keycloak_db:5432/keycloak_db
+      KC_DB_USERNAME: keycloak_user
+      KC_DB_PASSWORD: keycloak_password
+    command: 
+      - start-dev
+      - --import-realm
+    volumes:
+      - ./keycloak/realm-export.json:/opt/keycloak/data/import/realm-export.json
+    ports:
+      - "8080:8080"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://keycloak:8080/health || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    depends_on:
+      - keycloak_db
+    networks:
+      - dag_sample     
+  frontend:
+    image: subtask2_frontend
+    ports:
+      - "3000:3000"
+    environment:
+      REACT_APP_API_URL: http://report_service:3000
+      REACT_APP_KEYCLOAK_URL: http://keycloak:8080
+      REACT_APP_KEYCLOAK_REALM: reports-realm
+      REACT_APP_KEYCLOAK_CLIENT_ID: reports-frontend 
+    networks:
+      - dag_sample     
+  # frontend:
+  #   build:
+  #     context: ./frontend
+  #     dockerfile: Dockerfile
+  #   ports:
+  #     - "3000:3000"
+  #   environment:
+  #     REACT_APP_API_URL: http://localhost:3001
+  #     REACT_APP_KEYCLOAK_URL: http://localhost:8082
+  #     REACT_APP_KEYCLOAK_REALM: reports-realm
+  #     REACT_APP_KEYCLOAK_CLIENT_ID: reports-frontend 
+  #   networks:
+  #     - dag_sample     
+  report_service:
+    build:
+      context: ./report-service
+      dockerfile: Dockerfile
+    # stdin_open: true
+    # tty: true
+    # command: sh
+    ports:
+      - "8000:8000"
+    depends_on:
+      - keycloak
+    environment:
+      SERVER_ADDR: 0.0.0.0:8000
+      FRONTEND_ADDR: http://localhost:3000
+      KEYCLOAK_ISSUER_URL: http://keycloak:8080/realms/reports-realm
+      KEYCLOAK_REALM: reports-realm
+      CLIENT_ID: reports-frontend 
+      CLICKHOUSE_URL: http://clickhouse:8123
+      CLICKHOUSE_DB: bionicpro
+      CLICKHOUSE_USER: airflow
+      CLICKHOUSE_PASSWORD: airflow
+    networks:
+      - dag_sample  
+
+networks:
+  dag_sample:
+
+volumes:
+  postgres-keycloak-data:
