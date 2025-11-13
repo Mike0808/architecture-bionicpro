@@ -205,30 +205,30 @@ services:
       - keycloak_db
     networks:
       - dag_sample     
-  frontend:
-    image: subtask2_frontend
-    ports:
-      - "3000:3000"
-    environment:
-      REACT_APP_API_URL: http://report_service:3000
-      REACT_APP_KEYCLOAK_URL: http://keycloak:8080
-      REACT_APP_KEYCLOAK_REALM: reports-realm
-      REACT_APP_KEYCLOAK_CLIENT_ID: reports-frontend 
-    networks:
-      - dag_sample     
   # frontend:
-  #   build:
-  #     context: ./frontend
-  #     dockerfile: Dockerfile
+  #   image: subtask2_frontend
   #   ports:
   #     - "3000:3000"
   #   environment:
-  #     REACT_APP_API_URL: http://localhost:3001
-  #     REACT_APP_KEYCLOAK_URL: http://localhost:8082
+  #     REACT_APP_API_URL: http://report_service:3000
+  #     REACT_APP_KEYCLOAK_URL: http://keycloak:8080
   #     REACT_APP_KEYCLOAK_REALM: reports-realm
   #     REACT_APP_KEYCLOAK_CLIENT_ID: reports-frontend 
   #   networks:
   #     - dag_sample     
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    ports:
+      - "3000:3000"
+    environment:
+      REACT_APP_API_URL: http://localhost:3001
+      REACT_APP_KEYCLOAK_URL: http://localhost:8082
+      REACT_APP_KEYCLOAK_REALM: reports-realm
+      REACT_APP_KEYCLOAK_CLIENT_ID: reports-frontend 
+    networks:
+      - dag_sample     
   report_service:
     build:
       context: ./report-service
