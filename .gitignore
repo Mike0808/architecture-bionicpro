@@ -1,0 +1,6 @@
+/postgres-keycloak-data
+2024__yandex-architecture-sso.code-workspace
+__pycache__
+target
+node_modules
+*.bkp
